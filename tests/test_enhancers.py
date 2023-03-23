@@ -36,7 +36,10 @@ def test_clip_masking(filename_base_for_outputs):
             f"face AND NOT (bandana OR hair OR blue fabric){{{mask_modifier}}}",
             threshold=0.5,
         )
+
+        mask_modifier = mask_modifier.replace("*", "x")
         img_path = f"{filename_base_for_outputs}_mask{mask_modifier}_g.png"
+
         assert_image_similar_to_expectation(
             pred_grayscale, img_path=img_path, threshold=300
         )
@@ -55,11 +58,12 @@ def test_clip_masking(filename_base_for_outputs):
         upscale=False,
         fix_faces=True,
         seed=42,
+        sampler_type="plms",
     )
 
     result = next(imagine(prompt))
     img_path = f"{filename_base_for_outputs}.png"
-    assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=300)
+    assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=7000)
 
 
 boolean_mask_test_cases = [

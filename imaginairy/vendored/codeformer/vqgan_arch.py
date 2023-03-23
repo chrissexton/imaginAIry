@@ -1,14 +1,12 @@
 """
 VQGAN code, adapted from the original created by the Unleashing Transformers authors:
-https://github.com/samb-t/unleashing-transformers/blob/master/models/vqgan.py
+https://github.com/samb-t/unleashing-transformers/blob/master/models/vqgan.py.
 
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from basicsr.utils import get_root_logger
-from basicsr.utils.registry import ARCH_REGISTRY
 
 
 def normalize(in_channels):
@@ -25,7 +23,7 @@ def swish(x):
 #  Define VQVAE classes
 class VectorQuantizer(nn.Module):
     def __init__(self, codebook_size, emb_dim, beta):
-        super(VectorQuantizer, self).__init__()
+        super().__init__()
         self.codebook_size = codebook_size  # number of embeddings
         self.emb_dim = emb_dim  # dimension of embedding
         self.beta = beta  # commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
@@ -173,7 +171,7 @@ class Upsample(nn.Module):
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels=None):
-        super(ResBlock, self).__init__()
+        super().__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
         self.norm1 = normalize(in_channels)
@@ -362,7 +360,6 @@ class Generator(nn.Module):
         return x
 
 
-@ARCH_REGISTRY.register()
 class VQAutoEncoder(nn.Module):
     def __init__(
         self,
@@ -380,7 +377,7 @@ class VQAutoEncoder(nn.Module):
         model_path=None,
     ):
         super().__init__()
-        logger = get_root_logger()
+        # logger = get_root_logger()
         self.in_channels = 3
         self.nf = nf
         self.n_blocks = res_blocks
@@ -430,14 +427,14 @@ class VQAutoEncoder(nn.Module):
                 self.load_state_dict(
                     torch.load(model_path, map_location="cpu")["params_ema"]
                 )
-                logger.info(f"vqgan is loaded from: {model_path} [params_ema]")
+                # logger.info(f"vqgan is loaded from: {model_path} [params_ema]")
             elif "params" in chkpt:
                 self.load_state_dict(
                     torch.load(model_path, map_location="cpu")["params"]
                 )
-                logger.info(f"vqgan is loaded from: {model_path} [params]")
+                # logger.info(f"vqgan is loaded from: {model_path} [params]")
             else:
-                raise ValueError(f"Wrong params!")
+                raise ValueError("Wrong params!")
 
     def forward(self, x):
         x = self.encoder(x)
@@ -447,7 +444,6 @@ class VQAutoEncoder(nn.Module):
 
 
 # patch based discriminator
-@ARCH_REGISTRY.register()
 class VQGANDiscriminator(nn.Module):
     def __init__(self, nc=3, ndf=64, n_layers=4, model_path=None):
         super().__init__()
@@ -506,7 +502,7 @@ class VQGANDiscriminator(nn.Module):
                     torch.load(model_path, map_location="cpu")["params"]
                 )
             else:
-                raise ValueError(f"Wrong params!")
+                raise ValueError("Wrong params!")
 
     def forward(self, x):
         return self.main(x)

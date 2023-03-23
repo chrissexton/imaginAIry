@@ -7,22 +7,28 @@ from tqdm import tqdm
 
 from imaginairy.log_utils import increment_step, log_latent
 from imaginairy.modules.diffusion.util import extract_into_tensor, noise_like
-from imaginairy.samplers.base import NoiseSchedule, get_noise_prediction, mask_blend
+from imaginairy.samplers.base import (
+    ImageSampler,
+    NoiseSchedule,
+    SamplerName,
+    get_noise_prediction,
+    mask_blend,
+)
 from imaginairy.utils import get_device
 
 logger = logging.getLogger(__name__)
 
 
-class DDIMSampler:
+class DDIMSampler(ImageSampler):
     """
-    Denoising Diffusion Implicit Models
+    Denoising Diffusion Implicit Models.
 
     https://arxiv.org/abs/2010.02502
     """
 
-    def __init__(self, model):
-        self.model = model
-        self.device = get_device()
+    short_name = SamplerName.DDIM
+    name = "Denoising Diffusion Implicit Models"
+    default_steps = 40
 
     @torch.no_grad()
     def sample(
@@ -37,9 +43,10 @@ class DDIMSampler:
         orig_latent=None,
         temperature=1.0,
         noise_dropout=0.0,
-        initial_latent=None,
+        noise=None,
         t_start=None,
         quantize_x0=False,
+        **kwargs,
     ):
         schedule = NoiseSchedule(
             model_num_timesteps=self.model.num_timesteps,
@@ -48,16 +55,23 @@ class DDIMSampler:
             ddim_discretize="uniform",
         )
 
-        if initial_latent is None:
-            initial_latent = torch.randn(shape, device="cpu").to(self.device)
+        if noise is None:
+            noise = torch.randn(shape, device="cpu").to(self.device)
 
-        log_latent(initial_latent, "initial latent")
+        log_latent(noise, "initial noise")
 
         timesteps = schedule.ddim_timesteps[:t_start]
 
         time_range = np.flip(timesteps)
         total_steps = timesteps.shape[0]
-        noisy_latent = initial_latent
+
+        # t_start is none if init image strength set to 0
+        if orig_latent is not None and t_start is not None:
+            noisy_latent = self.noise_an_image(
+                init_latent=orig_latent, t=t_start - 1, schedule=schedule, noise=noise
+            )
+        else:
+            noisy_latent = noise
 
         mask_noise = None
         if mask is not None:
@@ -205,7 +219,8 @@ class DDIMSampler:
 
     @torch.no_grad()
     def noise_an_image(self, init_latent, t, schedule, noise=None):
-        # t serves as an index to gather the correct alphas
+        if isinstance(t, int):
+            t = torch.tensor([t], device=get_device())
         t = t.clamp(0, 1000)
         sqrt_alphas_cumprod = torch.sqrt(schedule.ddim_alphas)
         sqrt_one_minus_alphas_cumprod = schedule.ddim_sqrt_one_minus_alphas

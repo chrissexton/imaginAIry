@@ -3,9 +3,6 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-
-# from basicsr.archs.vqgan_arch import *
-from basicsr.utils.registry import ARCH_REGISTRY
 from torch import Tensor, nn
 
 from imaginairy.vendored.codeformer.vqgan_arch import ResBlock, VQAutoEncoder
@@ -95,7 +92,7 @@ class PositionEmbeddingSine(nn.Module):
 
 
 def _get_activation_fn(activation):
-    """Return an activation function given a string"""
+    """Return an activation function given a string."""
     if activation == "relu":
         return F.relu
     if activation == "gelu":
@@ -174,7 +171,7 @@ class Fuse_sft_block(nn.Module):
         return out
 
 
-@ARCH_REGISTRY.register()
+# @ARCH_REGISTRY.register()
 class CodeFormer(VQAutoEncoder):
     def __init__(
         self,
@@ -186,9 +183,7 @@ class CodeFormer(VQAutoEncoder):
         connect_list=["32", "64", "128", "256"],
         fix_modules=["quantize", "generator"],
     ):
-        super(CodeFormer, self).__init__(
-            512, 64, [1, 2, 2, 4, 4, 8], "nearest", 2, [16], codebook_size
-        )
+        super().__init__(512, 64, [1, 2, 2, 4, 4, 8], "nearest", 2, [16], codebook_size)
 
         if fix_modules is not None:
             for module in fix_modules:

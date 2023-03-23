@@ -3,7 +3,7 @@
  * All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  * For full license text, see LICENSE.txt file in the repo root or https://opensource.org/licenses/BSD-3-Clause
- * By Junnan Li
+ * By Junnan Li.
 """
 import warnings
 
@@ -34,7 +34,7 @@ class BLIP_Base(nn.Module):
         Args:
             med_config (str): path for the mixture of encoder-decoder model's configuration file
             image_size (int): input image size
-            vit (str): model size of vision transformer
+            vit (str): model size of vision transformer.
         """
         super().__init__()
 
@@ -47,7 +47,6 @@ class BLIP_Base(nn.Module):
         self.text_encoder = BertModel(config=med_config, add_pooling_layer=False)
 
     def forward(self, image, caption, mode):
-
         assert mode in [
             "image",
             "text",
@@ -102,7 +101,7 @@ class BLIP_Decoder(nn.Module):
         Args:
             med_config (str): path for the mixture of encoder-decoder model's configuration file
             image_size (int): input image size
-            vit (str): model size of vision transformer
+            vit (str): model size of vision transformer.
         """
         super().__init__()
 
@@ -118,7 +117,6 @@ class BLIP_Decoder(nn.Module):
         self.prompt_length = len(self.tokenizer(self.prompt).input_ids) - 1
 
     def forward(self, image, caption):
-
         image_embeds = self.visual_encoder(image)
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
@@ -242,7 +240,6 @@ def init_tokenizer():
 def create_vit(
     vit, image_size, use_grad_checkpointing=False, ckpt_layer=0, drop_path_rate=0
 ):
-
     assert vit in ["base", "large"], "vit parameter must be base or large"
     if vit == "base":
         vision_width = 768

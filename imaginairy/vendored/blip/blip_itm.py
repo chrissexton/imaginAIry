@@ -19,7 +19,7 @@ class BLIP_ITM(nn.Module):
         Args:
             med_config (str): path for the mixture of encoder-decoder model's configuration file
             image_size (int): input image size
-            vit (str): model size of vision transformer
+            vit (str): model size of vision transformer.
         """
         super().__init__()
 
@@ -39,7 +39,6 @@ class BLIP_ITM(nn.Module):
         self.itm_head = nn.Linear(text_width, 2)
 
     def forward(self, image, caption, match_head="itm"):
-
         image_embeds = self.visual_encoder(image)
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device

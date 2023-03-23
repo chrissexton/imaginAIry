@@ -1,47 +1,27 @@
 import gc
-import glob
 import logging
 import os
+import re
+import sys
+import urllib.parse
+from functools import wraps
 
 import requests
 import torch
+from huggingface_hub import HfFolder
+from huggingface_hub import hf_hub_download as _hf_hub_download
+from huggingface_hub import try_to_load_from_cache
 from omegaconf import OmegaConf
-from transformers import cached_path
-from transformers.utils.hub import TRANSFORMERS_CACHE, HfFolder
-from transformers.utils.hub import url_to_filename as tf_url_to_filename
+from safetensors.torch import load_file
 
+from imaginairy import config as iconfig
+from imaginairy.config import MODEL_SHORT_NAMES
+from imaginairy.modules import attention
 from imaginairy.paths import PKG_ROOT
 from imaginairy.utils import get_device, instantiate_from_config
 
 logger = logging.getLogger(__name__)
 
-MODEL_SHORTCUTS = {
-    "SD-1.4": (
-        "configs/stable-diffusion-v1.yaml",
-        "https://huggingface.co/bstddev/sd-v1-4/resolve/77221977fa8de8ab8f36fac0374c120bd5b53287/sd-v1-4.ckpt",
-    ),
-    "SD-1.5": (
-        "configs/stable-diffusion-v1.yaml",
-        "https://huggingface.co/acheong08/SD-V1-5-cloned/resolve/fc392f6bd4345b80fc2256fa8aded8766b6c629e/v1-5-pruned-emaonly.ckpt",
-    ),
-    "SD-1.5-inpaint": (
-        "configs/stable-diffusion-v1-inpaint.yaml",
-        "https://huggingface.co/julienacquaviva/inpainting/resolve/2155ff7fe38b55f4c0d99c2f1ab9b561f8311ca7/sd-v1-5-inpainting.ckpt",
-    ),
-    "SD-2.0": (
-        "configs/stable-diffusion-v2-inference.yaml",
-        "https://huggingface.co/stabilityai/stable-diffusion-2-base/resolve/main/512-base-ema.ckpt",
-    ),
-    "SD-2.0-inpaint": (
-        "configs/stable-diffusion-v2-inpainting-inference.yaml",
-        "https://huggingface.co/stabilityai/stable-diffusion-2-inpainting/resolve/main/512-inpainting-ema.ckpt",
-    ),
-    "SD-2.0-v": (
-        "configs/stable-diffusion-v2-inference-v.yaml",
-        "https://huggingface.co/stabilityai/stable-diffusion-2/resolve/main/768-v-ema.ckpt",
-    ),
-}
-DEFAULT_MODEL = "SD-2.0"
 
 LOADED_MODELS = {}
 MOST_RECENTLY_LOADED_MODEL = None
@@ -52,15 +32,26 @@ class HuggingFaceAuthorizationError(RuntimeError):
 
 
 class MemoryAwareModel:
-    """Wraps a model to allow dynamic loading/unloading as needed"""
+    """Wraps a model to allow dynamic loading/unloading as needed."""
 
-    def __init__(self, config_path, weights_path, half_mode=None):
+    def __init__(
+        self,
+        config_path,
+        weights_path,
+        control_weights_path=None,
+        half_mode=None,
+        for_training=False,
+    ):
         self._config_path = config_path
         self._weights_path = weights_path
+        self._control_weights_path = control_weights_path
         self._half_mode = half_mode
         self._model = None
+        self._for_training = for_training
 
-        LOADED_MODELS[(self._config_path, self._weights_path)] = self
+        LOADED_MODELS[
+            (self._config_path, self._weights_path, self._control_weights_path)
+        ] = self
 
     def __getattr__(self, key):
         if key == "_model":
@@ -71,74 +62,149 @@ class MemoryAwareModel:
             # unload all models in LOADED_MODELS
             for model in LOADED_MODELS.values():
                 model.unload_model()
-
-            model = load_model_from_config(
-                config=OmegaConf.load(f"{PKG_ROOT}/{self._config_path}"),
-                weights_location=self._weights_path,
-            )
+            model_config = OmegaConf.load(f"{PKG_ROOT}/{self._config_path}")
+            if self._for_training:
+                model_config.use_ema = True
+                # model_config.use_scheduler = True
 
             # only run half-mode on cuda. run it by default
             half_mode = self._half_mode is None and get_device() == "cuda"
-            if half_mode:
-                model = model.half()
+
+            model = load_model_from_config(
+                config=model_config,
+                weights_location=self._weights_path,
+                control_weights_location=self._control_weights_path,
+                half_mode=half_mode,
+            )
+            ks = 128
+            stride = 64
+            vqf = 8
+            model.split_input_params = {
+                "ks": (ks, ks),
+                "stride": (stride, stride),
+                "vqf": vqf,
+                "patch_distributed_vq": True,
+                "tie_braker": False,
+                "clip_max_weight": 0.5,
+                "clip_min_weight": 0.01,
+                "clip_max_tie_weight": 0.5,
+                "clip_min_tie_weight": 0.01,
+            }
+
             self._model = model
 
         return getattr(self._model, key)
 
     def unload_model(self):
-        del self._model
-        self._model = None
+        if self._model is not None:
+            del self._model.cond_stage_model
+            del self._model.first_stage_model
+            del self._model.model
+            del self._model
+            self._model = None
+        if get_device() == "cuda":
+            torch.cuda.empty_cache()
         gc.collect()
 
 
-def load_model_from_config(config, weights_location):
+def load_tensors(tensorfile, map_location=None):
+    if tensorfile == "empty":
+        # used for testing
+        return {}
+    if tensorfile.endswith((".ckpt", ".pth")):
+        return torch.load(tensorfile, map_location=map_location)
+    if tensorfile.endswith(".safetensors"):
+        return load_file(tensorfile, device=map_location)
+    raise ValueError(f"Unknown tensorfile type: {tensorfile}")
+
+
+def load_state_dict(weights_location):
     if weights_location.startswith("http"):
-        ckpt_path = get_cached_url_path(weights_location)
+        ckpt_path = get_cached_url_path(weights_location, category="weights")
     else:
         ckpt_path = weights_location
     logger.info(f"Loading model {ckpt_path} onto {get_device()} backend...")
-    pl_sd = None
+    state_dict = None
     try:
-        pl_sd = torch.load(ckpt_path, map_location="cpu")
+        state_dict = load_tensors(ckpt_path, map_location="cpu")
+    except FileNotFoundError as e:
+        if e.errno == 2:
+            logger.error(
+                f'Error: "{ckpt_path}" not a valid path to model weights.\nPreconfigured models you can use: {MODEL_SHORT_NAMES}.'
+            )
+            sys.exit(1)
+        raise e
     except RuntimeError as e:
         if "PytorchStreamReader failed reading zip archive" in str(e):
             if weights_location.startswith("http"):
                 logger.warning("Corrupt checkpoint. deleting and re-downloading...")
                 os.remove(ckpt_path)
-                ckpt_path = get_cached_url_path(weights_location)
-                pl_sd = torch.load(ckpt_path, map_location="cpu")
-        if pl_sd is None:
+                ckpt_path = get_cached_url_path(weights_location, category="weights")
+                state_dict = load_tensors(ckpt_path, map_location="cpu")
+        if state_dict is None:
             raise e
-    if "global_step" in pl_sd:
-        logger.debug(f"Global Step: {pl_sd['global_step']}")
-    state_dict = pl_sd["state_dict"]
-    model = instantiate_from_config(config.model)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
-    if len(missing_keys) > 0:
-        logger.debug(f"missing keys: {missing_keys}")
-    if len(unexpected_keys) > 0:
-        logger.debug(f"unexpected keys: {unexpected_keys}")
+    state_dict = state_dict.get("state_dict", state_dict)
+    return state_dict
+
+
+def load_model_from_config(
+    config, weights_location, control_weights_location=None, half_mode=False
+):
+    state_dict = load_state_dict(weights_location)
+    if control_weights_location:
+        controlnet_state_dict = load_state_dict(control_weights_location)
+        state_dict = add_controlnet(state_dict, controlnet_state_dict)
+
+    model = instantiate_from_config(config.model)
+    model.init_from_state_dict(state_dict)
+    if half_mode:
+        model = model.half()
 
     model.to(get_device())
     model.eval()
     return model
 
 
+def add_controlnet(base_state_dict, controlnet_state_dict):
+    """Merges a base sd15 model with a controlnet model."""
+    for key in controlnet_state_dict:
+        if key.startswith("control_"):
+            sd15_key_name = "model.diffusion_" + key[len("control_") :]
+        else:
+            sd15_key_name = key
+
+        if sd15_key_name in base_state_dict:
+            b = base_state_dict[sd15_key_name]
+            c_diff = controlnet_state_dict[key]
+            new_c = b + c_diff
+            base_state_dict[key] = new_c
+        else:
+            base_state_dict[key] = controlnet_state_dict[key]
+    return base_state_dict
+
+
 def get_diffusion_model(
-    weights_location=DEFAULT_MODEL,
+    weights_location=iconfig.DEFAULT_MODEL,
     config_path="configs/stable-diffusion-v1.yaml",
+    control_weights_location=None,
     half_mode=None,
     for_inpainting=False,
+    for_training=False,
 ):
     """
-    Load a diffusion model
+    Load a diffusion model.
 
     Weights location may also be shortcut name, e.g. "SD-1.5"
     """
     try:
         return _get_diffusion_model(
-            weights_location, config_path, half_mode, for_inpainting
+            weights_location,
+            config_path,
+            half_mode,
+            for_inpainting,
+            control_weights_location=control_weights_location,
+            for_training=for_training,
         )
     except HuggingFaceAuthorizationError as e:
         if for_inpainting:
@@ -146,34 +212,56 @@ def get_diffusion_model(
                 f"Failed to load inpainting model. Attempting to fall-back to standard model.   {str(e)}"
             )
             return _get_diffusion_model(
-                DEFAULT_MODEL, config_path, half_mode, for_inpainting=False
+                iconfig.DEFAULT_MODEL,
+                config_path,
+                half_mode,
+                for_inpainting=False,
+                for_training=for_training,
+                control_weights_location=control_weights_location,
             )
         raise e
 
 
 def _get_diffusion_model(
-    weights_location=DEFAULT_MODEL,
+    weights_location=iconfig.DEFAULT_MODEL,
     config_path="configs/stable-diffusion-v1.yaml",
     half_mode=None,
     for_inpainting=False,
+    for_training=False,
+    control_weights_location=None,
 ):
     """
-    Load a diffusion model
+    Load a diffusion model.
 
     Weights location may also be shortcut name, e.g. "SD-1.5"
     """
     global MOST_RECENTLY_LOADED_MODEL  # noqa
-    if weights_location is None:
-        weights_location = DEFAULT_MODEL
-    if for_inpainting and f"{weights_location}-inpaint" in MODEL_SHORTCUTS:
-        config_path, weights_location = MODEL_SHORTCUTS[f"{weights_location}-inpaint"]
-    elif weights_location in MODEL_SHORTCUTS:
-        config_path, weights_location = MODEL_SHORTCUTS[weights_location]
+    (
+        model_config,
+        weights_location,
+        config_path,
+        control_weights_location,
+    ) = resolve_model_paths(
+        weights_path=weights_location,
+        config_path=config_path,
+        control_weights_path=control_weights_location,
+        for_inpainting=for_inpainting,
+        for_training=for_training,
+    )
+    # some models need the attention calculated in float32
+    if model_config is not None:
+        attention.ATTENTION_PRECISION_OVERRIDE = model_config.forced_attn_precision
+    else:
+        attention.ATTENTION_PRECISION_OVERRIDE = "default"
 
-    key = (config_path, weights_location)
+    key = (config_path, weights_location, control_weights_location)
     if key not in LOADED_MODELS:
         MemoryAwareModel(
-            config_path=config_path, weights_path=weights_location, half_mode=half_mode
+            config_path=config_path,
+            weights_path=weights_location,
+            control_weights_path=control_weights_location,
+            half_mode=half_mode,
+            for_training=for_training,
         )
 
     model = LOADED_MODELS[key]
@@ -181,6 +269,65 @@ def _get_diffusion_model(
     model.num_timesteps_cond  # noqa
     MOST_RECENTLY_LOADED_MODEL = model
     return model
+
+
+def resolve_model_paths(
+    weights_path=iconfig.DEFAULT_MODEL,
+    config_path=None,
+    control_weights_path=None,
+    for_inpainting=False,
+    for_training=False,
+):
+    """Resolve weight and config path if they happen to be shortcuts."""
+    model_metadata_w = iconfig.MODEL_CONFIG_SHORTCUTS.get(weights_path, None)
+    model_metadata_c = iconfig.MODEL_CONFIG_SHORTCUTS.get(config_path, None)
+    control_net_metadata = iconfig.CONTROLNET_CONFIG_SHORTCUTS.get(
+        control_weights_path, None
+    )
+
+    if not control_net_metadata and for_inpainting:
+        model_metadata_w = iconfig.MODEL_CONFIG_SHORTCUTS.get(
+            f"{weights_path}-inpaint", model_metadata_w
+        )
+        model_metadata_c = iconfig.MODEL_CONFIG_SHORTCUTS.get(
+            f"{config_path}-inpaint", model_metadata_c
+        )
+
+    if model_metadata_w:
+        if config_path is None:
+            config_path = model_metadata_w.config_path
+        if for_training:
+            weights_path = model_metadata_w.weights_url_full
+            if weights_path is None:
+                raise ValueError(
+                    "No full training weights configured for this model. Edit the code or subimt a github issue."
+                )
+        else:
+            weights_path = model_metadata_w.weights_url
+
+    if model_metadata_c:
+        config_path = model_metadata_c.config_path
+
+    if config_path is None:
+        config_path = iconfig.MODEL_CONFIG_SHORTCUTS[iconfig.DEFAULT_MODEL].config_path
+    if control_net_metadata:
+        if "stable-diffusion-v1" not in config_path:
+            raise ValueError(
+                "Control net is only supported for stable diffusion v1. Please use a different model."
+            )
+        control_weights_path = control_net_metadata.weights_url
+        config_path = control_net_metadata.config_path
+    model_metadata = model_metadata_w or model_metadata_c
+    logger.debug(f"Loading model weights from: {weights_path}")
+    logger.debug(f"Loading model config from:  {config_path}")
+    return model_metadata, weights_path, config_path, control_weights_path
+
+
+def get_model_default_image_size(weights_location):
+    model_config = iconfig.MODEL_CONFIG_SHORTCUTS.get(weights_location, None)
+    if model_config:
+        return model_config.default_image_size
+    return 512
 
 
 def get_current_diffusion_model():
@@ -195,14 +342,14 @@ def get_cache_dir():
             xdg_cache_home = os.path.join(user_home, ".cache")
 
     if xdg_cache_home is not None:
-        return os.path.join(xdg_cache_home, "imaginairy", "weights")
+        return os.path.join(xdg_cache_home, "imaginairy")
 
-    return os.path.join(os.path.dirname(__file__), ".cached-downloads")
+    return os.path.join(os.path.dirname(__file__), ".cached-aimg")
 
 
-def get_cached_url_path(url):
+def get_cached_url_path(url, category=None):
     """
-    Gets the contents of a url, but caches the response indefinitely
+    Gets the contents of a url, but caches the response indefinitely.
 
     While we attempt to use the cached_path from huggingface transformers, we fall back
     to our own implementation if the url does not provide an etag header, which `cached_path`
@@ -211,30 +358,33 @@ def get_cached_url_path(url):
     """
 
     try:
-        return huggingface_cached_path(url)
+        if url.startswith("https://huggingface.co"):
+            return huggingface_cached_path(url)
     except (OSError, ValueError):
         pass
     filename = url.split("/")[-1]
     dest = get_cache_dir()
+    if category:
+        dest = os.path.join(dest, category)
     os.makedirs(dest, exist_ok=True)
-    dest_path = os.path.join(dest, filename)
+
+    # Replace possibly illegal destination path characters
+    safe_filename = re.sub('[*<>:"|?]', "_", filename)
+    dest_path = os.path.join(dest, safe_filename)
     if os.path.exists(dest_path):
         return dest_path
+
+    # check if it's saved at previous path and rename it
+    old_dest_path = os.path.join(dest, filename)
+    if os.path.exists(old_dest_path):
+        os.rename(old_dest_path, dest_path)
+        return dest_path
+
     r = requests.get(url)  # noqa
 
     with open(dest_path, "wb") as f:
         f.write(r.content)
     return dest_path
-
-
-def find_url_in_huggingface_cache(url):
-    huggingface_filename = os.path.join(TRANSFORMERS_CACHE, tf_url_to_filename(url))
-    for name in glob.glob(huggingface_filename + "*"):
-        if name.endswith((".json", ".lock")):
-            continue
-
-        return name
-    return None
 
 
 def check_huggingface_url_authorized(url):
@@ -255,11 +405,52 @@ def check_huggingface_url_authorized(url):
     return None
 
 
+@wraps(_hf_hub_download)
+def hf_hub_download(*args, **kwargs):
+    """
+    backwards compatible wrapper for huggingface's hf_hub_download.
+
+    they changed the argument name from `use_auth_token` to `token`
+    """
+
+    try:
+        return _hf_hub_download(*args, **kwargs)
+    except TypeError as e:
+        if "unexpected keyword argument 'token'" in str(e):
+            kwargs["use_auth_token"] = kwargs.pop("token")
+            return _hf_hub_download(*args, **kwargs)
+        raise e
+
+
 def huggingface_cached_path(url):
     # bypass all the HEAD calls done by the default `cached_path`
-    dest_path = find_url_in_huggingface_cache(url)
+    repo, commit_hash, filepath = extract_huggingface_repo_commit_file_from_url(url)
+    dest_path = try_to_load_from_cache(
+        repo_id=repo, revision=commit_hash, filename=filepath
+    )
     if not dest_path:
         check_huggingface_url_authorized(url)
         token = HfFolder.get_token()
-        dest_path = cached_path(url, use_auth_token=token)
+        logger.info(f"Downloading {url} from huggingface")
+        dest_path = hf_hub_download(
+            repo_id=repo, revision=commit_hash, filename=filepath, token=token
+        )
+        # make a refs folder so caching works
+        # work-around for
+        # https://github.com/huggingface/huggingface_hub/pull/1306
+        # https://github.com/brycedrennan/imaginAIry/issues/171
+        refs_url = dest_path[: dest_path.index("/snapshots/")] + "/refs/"
+        os.makedirs(refs_url, exist_ok=True)
     return dest_path
+
+
+def extract_huggingface_repo_commit_file_from_url(url):
+    parsed_url = urllib.parse.urlparse(url)
+    path_components = parsed_url.path.strip("/").split("/")
+
+    repo = "/".join(path_components[0:2])
+    assert path_components[2] == "resolve"
+    commit_hash = path_components[3]
+    filepath = "/".join(path_components[4:])
+
+    return repo, commit_hash, filepath

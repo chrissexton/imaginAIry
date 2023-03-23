@@ -5,12 +5,10 @@ import torch
 from diffusers.pipelines.stable_diffusion import safety_checker as safety_checker_mod
 from transformers import AutoFeatureExtractor
 
+from imaginairy.enhancers.blur_detect import is_blurry
+from imaginairy.schema import SafetyMode
+
 logger = logging.getLogger(__name__)
-
-
-class SafetyMode:
-    STRICT = "strict"
-    RELAXED = "relaxed"
 
 
 class SafetyResult:
@@ -133,7 +131,7 @@ def monkeypatch_safety_cosine_distance():
     def cosine_distance_float32(image_embeds, text_embeds):
         """
         In some environments we need to distance to be in float32
-        but it was coming as BFloat16
+        but it was coming as BFloat16.
         """
         return orig_cosine_distance(image_embeds, text_embeds).to(torch.float32)
 
@@ -145,6 +143,14 @@ _SPECIAL_CARE_DESCRIPTIONS = []
 
 
 def create_safety_score(img, safety_mode=SafetyMode.STRICT):
+    if is_blurry(img):
+        sr = SafetyResult()
+        sr.add_special_care_score(0, 0, 1)
+        sr.add_special_care_score(1, 0, 1)
+        sr.add_special_care_score(2, 0, 1)
+        sr.add_nsfw_score(0, 0, 1)
+        return sr
+
     safety_feature_extractor, safety_checker = safety_models()
     safety_checker_input = safety_feature_extractor([img], return_tensors="pt")
     clip_input = safety_checker_input.pixel_values

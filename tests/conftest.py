@@ -11,7 +11,7 @@ from urllib3 import HTTPConnectionPool
 
 from imaginairy import api
 from imaginairy.log_utils import suppress_annoying_logs_and_warnings
-from imaginairy.samplers.base import SAMPLER_TYPE_OPTIONS
+from imaginairy.samplers import SAMPLER_TYPE_OPTIONS
 from imaginairy.utils import (
     fix_torch_group_norm,
     fix_torch_nn_layer_norm,
@@ -90,7 +90,6 @@ def filename_base_for_orig_outputs(request):
 
 @pytest.fixture(params=SAMPLERS_FOR_TESTING)
 def sampler_type(request):
-
     return request.param
 
 

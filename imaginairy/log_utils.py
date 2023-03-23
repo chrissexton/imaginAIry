@@ -4,12 +4,6 @@ import re
 import time
 import warnings
 
-import torch
-from pytorch_lightning import _logger as pytorch_logger
-from torchvision.transforms import ToPILImage
-from transformers.modeling_utils import logger as modeling_logger
-from transformers.utils.logging import _configure_library_root_logger
-
 _CURRENT_LOGGING_CONTEXT = None
 
 logger = logging.getLogger(__name__)
@@ -79,6 +73,7 @@ class ImageLoggingContext:
         progress_img_callback=None,
         progress_img_interval_steps=3,
         progress_img_interval_min_s=0.1,
+        progress_latent_callback=None,
     ):
         self.prompt = prompt
         self.model = model
@@ -89,20 +84,24 @@ class ImageLoggingContext:
         self.progress_img_callback = progress_img_callback
         self.progress_img_interval_steps = progress_img_interval_steps
         self.progress_img_interval_min_s = progress_img_interval_min_s
+        self.progress_latent_callback = progress_latent_callback
 
         self.start_ts = time.perf_counter()
         self.timings = {}
         self.last_progress_img_ts = 0
         self.last_progress_img_step = -1000
 
+        self._prev_log_context = None
+
     def __enter__(self):
         global _CURRENT_LOGGING_CONTEXT  # noqa
+        self._prev_log_context = _CURRENT_LOGGING_CONTEXT
         _CURRENT_LOGGING_CONTEXT = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         global _CURRENT_LOGGING_CONTEXT  # noqa
-        _CURRENT_LOGGING_CONTEXT = None
+        _CURRENT_LOGGING_CONTEXT = self._prev_log_context
 
     def timing(self, description):
         return TimingContext(self, description)
@@ -124,6 +123,8 @@ class ImageLoggingContext:
         from imaginairy.img_utils import model_latents_to_pillow_imgs  # noqa
 
         if "predicted_latent" in description:
+            if self.progress_latent_callback is not None:
+                self.progress_latent_callback(latents)
             if (
                 self.step_count - self.last_progress_img_step
             ) > self.progress_img_interval_steps:
@@ -155,6 +156,9 @@ class ImageLoggingContext:
     def log_img(self, img, description):
         if not self.debug_img_callback:
             return
+        import torch
+        from torchvision.transforms import ToPILImage
+
         self.image_count += 1
         if isinstance(img, torch.Tensor):
             img = ToPILImage()(img.squeeze().cpu().detach())
@@ -196,6 +200,8 @@ def filesafe_text(t):
 
 
 def conditioning_to_img(conditioning):
+    from torchvision.transforms import ToPILImage
+
     return ToPILImage()(conditioning)
 
 
@@ -248,6 +254,9 @@ def configure_logging(level="INFO"):
 
 
 def disable_transformers_custom_logging():
+    from transformers.modeling_utils import logger as modeling_logger
+    from transformers.utils.logging import _configure_library_root_logger
+
     _configure_library_root_logger()
     _logger = modeling_logger.parent
     _logger.handlers = []
@@ -259,6 +268,16 @@ def disable_transformers_custom_logging():
 
 
 def disable_pytorch_lighting_custom_logging():
+    from pytorch_lightning import _logger as pytorch_logger
+
+    try:
+        from pytorch_lightning.utilities.seed import log  # noqa
+
+        log.setLevel(logging.NOTSET)
+        log.handlers = []
+        log.propagate = False
+    except ImportError:
+        pass
     pytorch_logger.setLevel(logging.NOTSET)
 
 

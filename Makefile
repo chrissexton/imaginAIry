@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-python_version = 3.10.6
+python_version = 3.10.10
 venv_prefix = imaginairy
 venv_name = $(venv_prefix)-$(python_version)
 pyenv_instructions=https://github.com/pyenv/pyenv#installation
@@ -17,6 +17,8 @@ init: require_pyenv  ## Setup a dev environment for local development.
 	pip install --upgrade pip pip-tools
 	pip-sync requirements-dev.txt
 	pip install -e . --no-deps
+	# the compiled requirements don't included OS specific subdependencies so we trigger those this way
+	pip install `pip freeze | grep "^torch=="`
 	@echo -e "\nEnvironment setup! ✨ 🍰 ✨ 🐍 \n\nCopy this path to tell PyCharm where your virtualenv is. You may have to click the refresh button in the pycharm file explorer.\n"
 	@echo -e "\033[0;32m"
 	@pyenv which python
@@ -27,8 +29,10 @@ init: require_pyenv  ## Setup a dev environment for local development.
 af: autoformat  ## Alias for `autoformat`
 autoformat:  ## Run the autoformatter.
 	@pycln . --all --quiet --extend-exclude __init__\.py
-	@isort --atomic --profile black .
+	@# ERA,T201
+	@-ruff --extend-ignore ANN,ARG001,C90,DTZ,D100,D101,D102,D103,D202,D203,D212,D415,E501,RET504,S101,UP006,UP007 --extend-select C,D400,I,W --unfixable T,ERA --fix-only .
 	@black .
+	@isort --atomic --profile black .
 
 test:  ## Run the tests.
 	@pytest
@@ -44,6 +48,7 @@ deploy:  ## Deploy the package to pypi.org
 	git push --tags
 	rm -rf dist
 	python setup.py bdist_wheel
+	python setup.py bdist_wheel --plat-name=win-amd64
 	#python setup.py sdist
 	@echo 'pypi.org Username: '
 	@read username && twine upload --verbose dist/* -u $$username;
@@ -58,7 +63,7 @@ run-dev: build-dev-image
 	docker run -it -v $$HOME/.cache/huggingface:/root/.cache/huggingface -v $$HOME/.cache/torch:/root/.cache/torch -v `pwd`/outputs:/outputs imaginairy-dev /bin/bash
 
 requirements:  ## Freeze the requirements.txt file
-	pip-compile setup.py requirements-dev.in --output-file=requirements-dev.txt --upgrade
+	pip-compile setup.py requirements-dev.in --output-file=requirements-dev.txt --upgrade --resolver=backtracking
 
 require_pyenv:
 	@if ! [ -x "$$(command -v pyenv)" ]; then\
@@ -85,7 +90,6 @@ vendor_openai_clip:
 
 revendorize: vendorize_kdiffusion
 	make vendorize REPO=git@github.com:openai/CLIP.git PKG=clip COMMIT=d50d76daa670286dd6cacf3bcd80b5e4823fc8e1
-
 	make af
 
 vendorize_clipseg:
@@ -116,7 +120,7 @@ vendorize_kdiffusion:
 	rm -rf ./imaginairy/vendored/k_diffusion
 	rm -rf ./downloads/k_diffusion
     # version 0.0.9
-	make vendorize REPO=git@github.com:crowsonkb/k-diffusion.git PKG=k_diffusion COMMIT=60e5042ca0da89c14d1dd59d73883280f8fce991
+	make vendorize REPO=git@github.com:crowsonkb/k-diffusion.git PKG=k_diffusion COMMIT=5b3af030dd83e0297272d861c19477735d0317ec
 	#sed -i '' -e 's/import\sclip/from\simaginairy.vendored\simport\sclip/g' imaginairy/vendored/k_diffusion/evaluation.py
 	mv ./downloads/k_diffusion/LICENSE ./imaginairy/vendored/k_diffusion/
 	rm imaginairy/vendored/k_diffusion/evaluation.py
@@ -125,11 +129,14 @@ vendorize_kdiffusion:
 	touch imaginairy/vendored/k_diffusion/config.py
 	# without this most of the k-diffusion samplers didn't work
 	sed -i '' -e 's#return (x - denoised) / utils.append_dims(sigma, x.ndim)#return (x - denoised) / sigma#g' imaginairy/vendored/k_diffusion/sampling.py
-	sed -i '' -e 's#x = x + torch.randn_like(x) \* sigma_up#x = x + torch.randn_like(x, device="cpu").to(x.device) \* sigma_up#g' imaginairy/vendored/k_diffusion/sampling.py
+	sed -i '' -e 's#torch.randn_like(x)#torch.randn_like(x, device="cpu").to(x.device)#g' imaginairy/vendored/k_diffusion/sampling.py
  	# https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/4558#issuecomment-1310387114
 	sed -i '' -e 's#t_fn = lambda sigma: sigma.log().neg()#t_fn = lambda sigma: sigma.to("cpu").log().neg().to(x.device)#g' imaginairy/vendored/k_diffusion/sampling.py
-	sed -i '' -e 's#return (x - denoised) / sigma#return (x - denoised) / sigma#g' imaginairy/vendored/k_diffusion/sampling.py
+	sed -i '' -e 's#return (x - denoised) / sigma#return ((x - denoised) / sigma.to("cpu")).to(x.device)#g' imaginairy/vendored/k_diffusion/sampling.py
 	sed -i '' -e 's#return t.neg().exp()#return t.to("cpu").neg().exp().to(self.model.device)#g' imaginairy/vendored/k_diffusion/sampling.py
+	sed -i '' -e 's#import torchsde##g' imaginairy/vendored/k_diffusion/sampling.py
+	sed -i '' -e 's#torch.randint(0, 2\*\*63 - 1, \[\])#torch.randint(0, 2**63 - 1, [], device="cpu")#g' imaginairy/vendored/k_diffusion/sampling.py
+	sed -i '' -e 's#torch.randint_like(x, 2)#torch.randint_like(x, 2, device="cpu")#g' imaginairy/vendored/k_diffusion/sampling.py
 	make af
 
 vendorize_noodle_soup:

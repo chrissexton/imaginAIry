@@ -18,7 +18,7 @@ def get_model():
 
 
 def find_img_text_similarity(image: Image.Image, phrases: Sequence):
-    """Find the likelihood of a list of textual concepts existing in the image"""
+    """Find the likelihood of a list of textual concepts existing in the image."""
 
     model, preprocess = get_model()
     image = preprocess(image).unsqueeze(0).to(device)

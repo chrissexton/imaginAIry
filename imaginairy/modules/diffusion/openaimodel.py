@@ -4,6 +4,7 @@ from abc import abstractmethod
 import numpy as np
 import torch as th
 import torch.nn.functional as F
+from omegaconf.listconfig import ListConfig
 from torch import nn
 
 from imaginairy.modules.attention import SpatialTransformer
@@ -29,7 +30,7 @@ def convert_module_to_f32(_):
 
 class AttentionPool2d(nn.Module):
     """
-    Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py
+    Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py.
     """
 
     def __init__(
@@ -122,7 +123,7 @@ class Upsample(nn.Module):
 
 
 class TransposedUpsample(nn.Module):
-    """Learned 2x upsampling without padding"""
+    """Learned 2x upsampling without padding."""
 
     def __init__(self, channels, out_channels=None, ks=5):
         super().__init__()
@@ -345,7 +346,7 @@ def count_flops_attn(model, _x, y):
             model,
             inputs=(inputs, timestamps),
             custom_ops={QKVAttention: QKVAttention.count_flops},
-        )
+        ).
     """
     b, c, *spatial = y[0].shape
     num_spatial = int(np.prod(spatial))
@@ -358,7 +359,7 @@ def count_flops_attn(model, _x, y):
 
 class QKVAttentionLegacy(nn.Module):
     """
-    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
+    A module which performs QKV attention. Matches legacy QKVAttention + input/output heads shaping.
     """
 
     def __init__(self, n_heads):
@@ -493,9 +494,8 @@ class UNetModel(nn.Module):
             assert (
                 use_spatial_transformer
             ), "Fool!! You forgot to use the spatial transformer for your cross-attention conditioning..."
-            from omegaconf.listconfig import ListConfig
 
-            if type(context_dim) == ListConfig:
+            if isinstance(context_dim, ListConfig):
                 context_dim = list(context_dim)
 
         if num_heads_upsample == -1:
@@ -530,11 +530,10 @@ class UNetModel(nn.Module):
         if num_attention_blocks is not None:
             assert len(num_attention_blocks) == len(self.num_res_blocks)
             assert all(
-                map(
-                    lambda i: self.num_res_blocks[i] >= num_attention_blocks[i],
-                    range(len(num_attention_blocks)),
-                )
+                self.num_res_blocks[i] >= num_attention_blocks[i]
+                for i in range(len(num_attention_blocks))
             )
+
             print(
                 f"Constructor of UNetModel received num_attention_blocks={num_attention_blocks}. "
                 f"This option has LESS priority than attention_resolutions {attention_resolutions}, "
@@ -837,10 +836,13 @@ class UNetModel(nn.Module):
             hs.append(h)
         h = self.middle_block(h, emb, context)
         for module in self.output_blocks:
+            # allows us to work with multiples of 8 instead of 64 for image sizes
+            # https://github.com/CompVis/stable-diffusion/issues/60#issuecomment-1240294667
+            if h.shape[-2:] != hs[-1].shape[-2:]:
+                h = F.interpolate(h, hs[-1].shape[-2:], mode="nearest")
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
-        else:
-            return self.out(h)
+        return self.out(h)

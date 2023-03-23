@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 
 import psutil
 import torch
@@ -6,16 +7,23 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import einsum, nn
 
-from imaginairy.modules.diffusion.util import checkpoint
+from imaginairy.modules.diffusion.util import checkpoint as checkpoint_eval
 from imaginairy.utils import get_device
 
-try:
-    import xformers
-    import xformers.ops
+XFORMERS_IS_AVAILABLE = False
 
-    XFORMERS_IS_AVAILBLE = True
-except:
-    XFORMERS_IS_AVAILBLE = False
+try:
+    if get_device() == "cuda":
+        import xformers  # noqa
+        import xformers.ops  # noqa
+
+        XFORMERS_IS_AVAILABLE = True
+except ImportError:
+    pass
+
+
+ALLOW_SPLITMEM = True
+ATTENTION_PRECISION_OVERRIDE = "default"
 
 
 class GEGLU(nn.Module):
@@ -147,6 +155,11 @@ def get_mem_free_total(device):
     return mem_free_total
 
 
+@lru_cache(maxsize=1)
+def get_mps_gb_ram():
+    return psutil.virtual_memory().total / (1024**3)
+
+
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
@@ -171,19 +184,29 @@ class CrossAttention(nn.Module):
         #     mask = _global_mask_hack.to(torch.bool)
 
         if get_device() == "cuda" or "mps" in get_device():
-            return self.forward_splitmem(x, context=context, mask=mask)
+            if not XFORMERS_IS_AVAILABLE and ALLOW_SPLITMEM:
+                return self.forward_splitmem(x, context=context, mask=mask)
 
         h = self.heads
+        # print(x.shape)
 
         q = self.to_q(x)
         context = context if context is not None else x
-        k = self.to_k(context)
+        k = self.to_k(context) * self.scale
         v = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
+        q, k, v = (rearrange(t, "b n (h d) -> (b h) n d", h=h) for t in (q, k, v))
 
-        sim = einsum("b i d, b j d -> b i j", q, k) * self.scale
-
+        # force cast to fp32 to avoid overflowing
+        if ATTENTION_PRECISION_OVERRIDE == "fp32":
+            with torch.autocast(enabled=False, device_type=get_device()):
+                q, k = q.float(), k.float()
+                sim = einsum("b i d, b j d -> b i j", q, k)
+        else:
+            sim = einsum("b i d, b j d -> b i j", q, k)
+        # print(sim.shape)
+        # print("*" * 100)
+        del q, k
         # if mask is not None:
         #     if sim.shape[2] == 320 and False:
         #         mask = [mask] * 2
@@ -208,8 +231,8 @@ class CrossAttention(nn.Module):
         v_in = self.to_v(context)
         del context, x
 
-        q, k, v = map(
-            lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q_in, k_in, v_in)
+        q, k, v = (
+            rearrange(t, "b n (h d) -> (b h) n d", h=h) for t in (q_in, k_in, v_in)
         )
         del q_in, k_in, v_in
 
@@ -221,22 +244,45 @@ class CrossAttention(nn.Module):
         tensor_size = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size()
         modifier = 3 if q.element_size() == 2 else 2.5
         mem_required = tensor_size * modifier
+
         steps = 1
 
-        if mem_required > mem_free_total:
-            steps = 2 ** (math.ceil(math.log(mem_required / mem_free_total, 2)))
+        if "mps" in get_device():
+            # https://github.com/brycedrennan/imaginAIry/issues/175
+            # https://github.com/invoke-ai/InvokeAI/issues/1244
+            mps_gb = get_mps_gb_ram()
+            factor = 32 / mps_gb
 
-        if steps > 64:
-            max_res = math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
-            raise RuntimeError(
-                f"Not enough memory, use lower resolution (max approx. {max_res}x{max_res}). "
-                f"Need: {mem_required / 64 / gb:0.1f}GB free, Have:{mem_free_total / gb:0.1f}GB free"
+            slice_size = math.floor(2**30 / (q.shape[0] * q.shape[1] * 16 * factor))
+        else:
+            if mem_required > mem_free_total:
+                steps = 2 ** (math.ceil(math.log(mem_required / mem_free_total, 2)))
+
+            if steps > 64:
+                max_res = (
+                    math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
+                )
+                raise RuntimeError(
+                    f"Not enough memory, use lower resolution (max approx. {max_res}x{max_res}). "
+                    f"Need: {mem_required / 64 / gb:0.1f}GB free, Have:{mem_free_total / gb:0.1f}GB free"
+                )
+            slice_size = (
+                q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
             )
 
-        slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
+        # steps = len(range(0, q.shape[1], slice_size))
+        # print(f"Splitting attention into {steps} steps of {slice_size} slices")
+
         for i in range(0, q.shape[1], slice_size):
             end = i + slice_size
-            s1 = einsum("b i d, b j d -> b i j", q[:, i:end], k)
+
+            # force cast to fp32 to avoid overflowing
+            if ATTENTION_PRECISION_OVERRIDE == "fp32":
+                with torch.autocast(enabled=False, device_type=get_device()):
+                    q, k = q.float(), k.float()
+                    s1 = einsum("b i d, b j d -> b i j", q[:, i:end], k)
+            else:
+                s1 = einsum("b i d, b j d -> b i j", q[:, i:end], k)
 
             s2 = s1.softmax(dim=-1, dtype=q.dtype)
             del s1
@@ -282,13 +328,13 @@ class MemoryEfficientCrossAttention(nn.Module):
         v = self.to_v(context)
 
         b, _, _ = q.shape
-        q, k, v = map(
-            lambda t: t.unsqueeze(3)
+        q, k, v = (
+            t.unsqueeze(3)
             .reshape(b, t.shape[1], self.heads, self.dim_head)
             .permute(0, 2, 1, 3)
             .reshape(b * self.heads, t.shape[1], self.dim_head)
-            .contiguous(),
-            (q, k, v),
+            .contiguous()
+            for t in (q, k, v)
         )
 
         # actually compute the attention, what we cannot get enough of
@@ -325,7 +371,7 @@ class BasicTransformerBlock(nn.Module):
         disable_self_attn=False,
     ):
         super().__init__()
-        attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
+        attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILABLE else "softmax"
         assert attn_mode in self.ATTENTION_MODES
         attn_cls = self.ATTENTION_MODES[attn_mode]
         self.disable_self_attn = disable_self_attn
@@ -350,7 +396,7 @@ class BasicTransformerBlock(nn.Module):
         self.checkpoint = checkpoint
 
     def forward(self, x, context=None):
-        return checkpoint(
+        return checkpoint_eval(
             self._forward, (x, context), self.parameters(), self.checkpoint
         )
 
@@ -374,7 +420,7 @@ class SpatialTransformer(nn.Module):
     and reshape to b, t, d.
     Then apply standard transformer action.
     Finally, reshape to image
-    NEW: use_linear for more efficiency instead of the 1x1 convs
+    NEW: use_linear for more efficiency instead of the 1x1 convs.
     """
 
     def __init__(
@@ -428,19 +474,22 @@ class SpatialTransformer(nn.Module):
         # note: if no context is given, cross-attention defaults to self-attention
         if not isinstance(context, list):
             context = [context]
-        b, c, h, w = x.shape
+        b, c, h, w = x.shape  # noqa
         x_in = x
         x = self.norm(x)
-        if not self.use_linear:
-            x = self.proj_in(x)
-        x = rearrange(x, "b c h w -> b (h w) c").contiguous()
         if self.use_linear:
+            x = rearrange(x, "b c h w -> b (h w) c").contiguous()
             x = self.proj_in(x)
-        for i, block in enumerate(self.transformer_blocks):
-            x = block(x, context=context[i])
-        if self.use_linear:
+            for i, block in enumerate(self.transformer_blocks):
+                x = block(x, context=context[i])
             x = self.proj_out(x)
-        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
-        if not self.use_linear:
+            x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+        else:
+            x = self.proj_in(x)
+            x = rearrange(x, "b c h w -> b (h w) c")
+            for i, block in enumerate(self.transformer_blocks):
+                x = block(x, context=context[i])
+            x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
             x = self.proj_out(x)
+
         return x + x_in

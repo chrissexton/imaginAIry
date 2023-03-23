@@ -57,7 +57,7 @@ def make_beta_schedule(
 
 
 def frange(start, stop, step):
-    """Range but handles floats"""
+    """Range but handles floats."""
     x = start
     while True:
         if x >= stop:
@@ -243,12 +243,6 @@ def normalization(channels):
     :return: an nn.Module for normalization.
     """
     return GroupNorm32(32, channels)
-
-
-# PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
-class SiLU(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(x)
 
 
 class GroupNorm32(nn.GroupNorm):

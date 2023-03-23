@@ -19,7 +19,7 @@ class BLIP_VQA(nn.Module):
         Args:
             med_config (str): path for the mixture of encoder-decoder model's configuration file
             image_size (int): input image size
-            vit (str): model size of vision transformer
+            vit (str): model size of vision transformer.
         """
         super().__init__()
 
@@ -46,7 +46,6 @@ class BLIP_VQA(nn.Module):
         inference="rank",
         k_test=128,
     ):
-
         image_embeds = self.visual_encoder(image)
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
@@ -160,7 +159,6 @@ class BLIP_VQA(nn.Module):
                 return max_ids
 
     def rank_answer(self, question_states, question_atts, answer_ids, answer_atts, k):
-
         num_ques = question_states.size(0)
         start_ids = answer_ids[0, 0].repeat(num_ques, 1)  # bos token
 
